@@ -13,36 +13,59 @@
 #define PACKET_TTL 128
 #define PACKET_WINDOW_SIZE 256
 
+struct pseudoheader {
+	uint32_t src;
+	uint32_t dst;
+	uint8_t zero;
+	uint8_t proto;
+	uint16_t length;
+};
+
 unsigned short
 checksum(void *buf, int len)
 {
-	int len_left = len;
-	int sum = 0;
-	unsigned short *word = (unsigned short *)buf;
-	unsigned short answer = 0;
+	int i;
+	unsigned short *data;
+	unsigned int sum;
 
-	while (len_left > 1)
+	sum = 0;
+	data = (unsigned short *)buf;
+	for (i = 0; i < len - 1; i += 2)
 	{
-		sum += *word++;
-		len_left -= sizeof(unsigned short);
+		sum += *data;
+		data++;
 	}
 
-	if (len_left == 1)
-	{
-		*(unsigned char *)(&answer) = *(unsigned char *)word;
-		sum += answer;
-	}
+	if (len & 1)
+		sum += ((unsigned char*)buf)[i];
 
-	sum = (sum >> 16) + (sum & 0xFFFF);
-	sum += (sum >> 16);
-	answer = ~sum;
-	return answer;
+	while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+
+	return ~sum;
 }
 
-char *generate_synack(struct iphdr *src_iphdr, struct tcphdr *src_tcphdr)
+unsigned short
+tcp_checksum(struct iphdr *iphdr, struct tcphdr *tcphdr)
+{
+	char buf[sizeof(struct pseudoheader) + sizeof(struct tcphdr)];
+	struct pseudoheader *phdr;
+
+	phdr = (struct pseudoheader *)buf;
+	phdr->src = iphdr->saddr;
+	phdr->dst = iphdr->daddr;
+	phdr->zero = 0;
+	phdr->proto = IPPROTO_TCP;
+	phdr->length = htons(sizeof(struct tcphdr));
+
+	memcpy(&buf[sizeof(struct pseudoheader)], tcphdr, sizeof(struct tcphdr));
+
+	return checksum(buf, sizeof(struct pseudoheader) + sizeof(struct tcphdr));
+}
+
+char *generate_tcp(struct iphdr *src_iphdr, struct tcphdr *src_tcphdr, int rst)
 {
 #define PACKET_LEN (sizeof(struct iphdr) + sizeof(struct tcphdr))
-	char *buf;
+	unsigned char *buf;
 	struct iphdr *iphdr;
 	struct tcphdr *tcphdr;
 	char ipstr[INET_ADDRSTRLEN];
@@ -60,7 +83,7 @@ char *generate_synack(struct iphdr *src_iphdr, struct tcphdr *src_tcphdr)
 	iphdr->tos = 0;
 	iphdr->tot_len = htons(PACKET_LEN);
 	iphdr->id = 0;
-	iphdr->frag_off = 0;
+	iphdr->frag_off = htons(IP_DF);
 	iphdr->ttl = PACKET_TTL;
 	iphdr->protocol = IPPROTO_TCP;
 	iphdr->check = 0;
@@ -69,19 +92,29 @@ char *generate_synack(struct iphdr *src_iphdr, struct tcphdr *src_tcphdr)
 
 	tcphdr->source = src_tcphdr->dest;
 	tcphdr->dest = src_tcphdr->source;
-	tcphdr->seq = src_tcphdr->seq;
-	tcphdr->ack_seq = src_tcphdr->seq + 1;
-	tcphdr->syn = 1;
-	tcphdr->ack = 1;
+	tcphdr->doff = 0x5;
 	tcphdr->window = htons(PACKET_WINDOW_SIZE);
 	tcphdr->check = 0;
 	tcphdr->urg_ptr = 0;
 
-	tcphdr->check = checksum(tcphdr, sizeof(struct tcphdr));
-	iphdr->check = checksum(iphdr, PACKET_LEN);
+	if (rst)
+	{
+		tcphdr->rst = 1;
+	}
+	else
+	{
+		tcphdr->syn = 1;
+		tcphdr->ack = 1;
+		tcphdr->ack_seq = htonl(htonl(src_tcphdr->seq) + 1);
+		tcphdr->seq = src_tcphdr->seq;
+	}
 
-	inet_ntop(AF_INET, &iphdr->daddr, ipstr, INET_ADDRSTRLEN); 
+	tcphdr->check = tcp_checksum(iphdr, tcphdr);
+	iphdr->check = checksum(iphdr, sizeof(struct iphdr));
+
+	inet_ntop(AF_INET, &iphdr->daddr, ipstr, INET_ADDRSTRLEN);
 	printf("Sending SYN-ACK to %s:%d\n", ipstr, htons(tcphdr->dest));
+
 	return buf;
 }
 
@@ -99,15 +132,16 @@ int main(int argc, char *argv[])
 
 	for (;;)
 	{
-		char ver_ihl;
-		char *buf, *snd_buf;
+		unsigned char ver_ihl;
+		unsigned char *buf, *snd_buf;
 		int iphdrlen;
 		struct tcphdr *tcp_header;
 		struct iphdr *ip_header;
-		struct sockaddr_in dest;
+		struct sockaddr_ll from;
+		socklen_t from_len;
 
 		recv_bytes = recvfrom(sock, &ver_ihl, 1, MSG_PEEK, NULL, NULL);
-		if (recv_bytes <= 0)
+		if (recv_bytes != 1)
 		{
 			printf("recv() failed: %d\n", errno);
 			return -1;
@@ -127,7 +161,8 @@ int main(int argc, char *argv[])
 			return -1;
 		}
 
-		recv_bytes = recvfrom(sock, buf, iphdrlen + sizeof(struct tcphdr), 0, NULL, NULL);
+		from_len = sizeof(from);
+		recv_bytes = recvfrom(sock, buf, iphdrlen + sizeof(struct tcphdr), 0, (struct sockaddr*)&from, &from_len);
 		if (recv_bytes <= 0)
 		{
 			printf("recv() #2 failed: %d\n", errno);
@@ -158,25 +193,46 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
-		dest.sin_family = AF_INET;
-		dest.sin_port = 0;
-		dest.sin_addr.s_addr = ip_header->saddr;
-
-		snd_buf = generate_synack(ip_header, tcp_header);
-		free(buf);
+		/* send SYN-ACK */
+		snd_buf = generate_tcp(ip_header, tcp_header, 0);
 		if (snd_buf == NULL)
 		{
-			printf("generate_synack() failed\n");
+			printf("generate_tcp() failed\n");
+			free(buf);
 			return -1;
 		}
 
-		send_bytes = sendto(sock, snd_buf, PACKET_LEN, 0, (struct sockaddr*)&dest, sizeof(dest));
-		if (send_bytes < PACKET_LEN)
+		send_bytes = sendto(sock, snd_buf, PACKET_LEN, 0, (struct sockaddr*)&from, sizeof(from));
+		if (send_bytes != PACKET_LEN)
 		{
-			printf("sendto() failed\n");
+			printf("sendto() failed: %d\n", errno);
+			free(buf);
 			return -1;
 		}
 
 		free(snd_buf);
+
+#if 0
+		/* send RST */
+		snd_buf = generate_tcp(ip_header, tcp_header, 1);
+		if (snd_buf == NULL)
+		{
+			printf("generate_tcp() failed\n");
+			free(buf);
+			return -1;
+		}
+
+		send_bytes = sendto(sock, snd_buf, PACKET_LEN, 0, (struct sockaddr*)&from, sizeof(from));
+		if (send_bytes != PACKET_LEN)
+		{
+			printf("sendto() failed: %d\n", errno);
+			free(buf);
+			free(snd_buf);
+			return -1;
+		}
+
+		free(snd_buf);
+#endif
+		free(buf);
 	}
 }
