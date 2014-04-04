@@ -113,7 +113,7 @@ char *generate_tcp(struct iphdr *src_iphdr, struct tcphdr *src_tcphdr, int rst)
 	iphdr->check = checksum(iphdr, sizeof(struct iphdr));
 
 	inet_ntop(AF_INET, &iphdr->daddr, ipstr, INET_ADDRSTRLEN);
-	printf("Sending SYN-ACK to %s:%d\n", ipstr, htons(tcphdr->dest));
+	printf("SYN from %s on port %d\n", ipstr, htons(tcphdr->source));
 
 	return buf;
 }
